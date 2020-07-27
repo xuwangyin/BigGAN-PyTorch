@@ -9,8 +9,8 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.nn import Parameter as P
 
-import layers
-from sync_batchnorm import SynchronizedBatchNorm2d as SyncBatchNorm2d
+from .layers import SNConv2d, SNLinear, ccbn, identity, GBlock, Attention, bn, SNEmbedding, DBlock
+# from sync_batchnorm import SynchronizedBatchNorm2d as SyncBatchNorm2d
 
 
 # Architectures for G
@@ -118,11 +118,11 @@ class Generator(nn.Module):
 
     # Which convs, batchnorms, and linear layers to use
     if self.G_param == 'SN':
-      self.which_conv = functools.partial(layers.SNConv2d,
+      self.which_conv = functools.partial(SNConv2d,
                           kernel_size=3, padding=1,
                           num_svs=num_G_SVs, num_itrs=num_G_SV_itrs,
                           eps=self.SN_eps)
-      self.which_linear = functools.partial(layers.SNLinear,
+      self.which_linear = functools.partial(SNLinear,
                           num_svs=num_G_SVs, num_itrs=num_G_SV_itrs,
                           eps=self.SN_eps)
     else:
@@ -134,7 +134,7 @@ class Generator(nn.Module):
     self.which_embedding = nn.Embedding
     bn_linear = (functools.partial(self.which_linear, bias=False) if self.G_shared
                  else self.which_embedding)
-    self.which_bn = functools.partial(layers.ccbn,
+    self.which_bn = functools.partial(ccbn,
                           which_linear=bn_linear,
                           cross_replica=self.cross_replica,
                           mybn=self.mybn,
@@ -147,7 +147,7 @@ class Generator(nn.Module):
     # Prepare model
     # If not using shared embeddings, self.shared is just a passthrough
     self.shared = (self.which_embedding(n_classes, self.shared_dim) if G_shared 
-                    else layers.identity())
+                    else identity())
     # First linear layer
     self.linear = self.which_linear(self.dim_z // self.num_slots,
                                     self.arch['in_channels'][0] * (self.bottom_width **2))
@@ -157,7 +157,7 @@ class Generator(nn.Module):
     # while the inner loop is over a given block
     self.blocks = []
     for index in range(len(self.arch['out_channels'])):
-      self.blocks += [[layers.GBlock(in_channels=self.arch['in_channels'][index],
+      self.blocks += [[GBlock(in_channels=self.arch['in_channels'][index],
                              out_channels=self.arch['out_channels'][index],
                              which_conv=self.which_conv,
                              which_bn=self.which_bn,
@@ -168,14 +168,14 @@ class Generator(nn.Module):
       # If attention on this block, attach it to the end
       if self.arch['attention'][self.arch['resolution'][index]]:
         print('Adding attention layer in G at resolution %d' % self.arch['resolution'][index])
-        self.blocks[-1] += [layers.Attention(self.arch['out_channels'][index], self.which_conv)]
+        self.blocks[-1] += [Attention(self.arch['out_channels'][index], self.which_conv)]
 
     # Turn self.blocks into a ModuleList so that it's all properly registered.
     self.blocks = nn.ModuleList([nn.ModuleList(block) for block in self.blocks])
 
     # output layer: batchnorm-relu-conv.
     # Consider using a non-spectral conv here
-    self.output_layer = nn.Sequential(layers.bn(self.arch['out_channels'][-1],
+    self.output_layer = nn.Sequential(bn(self.arch['out_channels'][-1],
                                                 cross_replica=self.cross_replica,
                                                 mybn=self.mybn),
                                     self.activation,
@@ -317,14 +317,14 @@ class Discriminator(nn.Module):
     # Which convs, batchnorms, and linear layers to use
     # No option to turn off SN in D right now
     if self.D_param == 'SN':
-      self.which_conv = functools.partial(layers.SNConv2d,
+      self.which_conv = functools.partial(SNConv2d,
                           kernel_size=3, padding=1,
                           num_svs=num_D_SVs, num_itrs=num_D_SV_itrs,
                           eps=self.SN_eps)
-      self.which_linear = functools.partial(layers.SNLinear,
+      self.which_linear = functools.partial(SNLinear,
                           num_svs=num_D_SVs, num_itrs=num_D_SV_itrs,
                           eps=self.SN_eps)
-      self.which_embedding = functools.partial(layers.SNEmbedding,
+      self.which_embedding = functools.partial(SNEmbedding,
                               num_svs=num_D_SVs, num_itrs=num_D_SV_itrs,
                               eps=self.SN_eps)
     # Prepare model
@@ -332,7 +332,7 @@ class Discriminator(nn.Module):
     # to be over blocks at a given resolution (resblocks and/or self-attention)
     self.blocks = []
     for index in range(len(self.arch['out_channels'])):
-      self.blocks += [[layers.DBlock(in_channels=self.arch['in_channels'][index],
+      self.blocks += [[DBlock(in_channels=self.arch['in_channels'][index],
                        out_channels=self.arch['out_channels'][index],
                        which_conv=self.which_conv,
                        wide=self.D_wide,
@@ -342,7 +342,7 @@ class Discriminator(nn.Module):
       # If attention on this block, attach it to the end
       if self.arch['attention'][self.arch['resolution'][index]]:
         print('Adding attention layer in D at resolution %d' % self.arch['resolution'][index])
-        self.blocks[-1] += [layers.Attention(self.arch['out_channels'][index],
+        self.blocks[-1] += [Attention(self.arch['out_channels'][index],
                                              self.which_conv)]
     # Turn self.blocks into a ModuleList so that it's all properly registered.
     self.blocks = nn.ModuleList([nn.ModuleList(block) for block in self.blocks])
@@ -350,8 +350,9 @@ class Discriminator(nn.Module):
     # larger if we're e.g. turning this into a VAE with an inference output
     self.linear = self.which_linear(self.arch['out_channels'][-1], output_dim)
     # Embedding for projection discrimination
-    self.embed = self.which_embedding(self.n_classes, self.arch['out_channels'][-1])
+    # self.embed = self.which_embedding(self.n_classes, self.arch['out_channels'][-1])
 
+    '''
     # Initialize weights
     if not skip_init:
       self.init_weights()
@@ -369,6 +370,7 @@ class Discriminator(nn.Module):
     # LR scheduling, left here for forward compatibility
     # self.lr_sched = {'itr' : 0}# if self.progressive else {}
     # self.j = 0
+    '''
 
   # Initialize
   def init_weights(self):
@@ -400,7 +402,7 @@ class Discriminator(nn.Module):
     # Get initial class-unconditional output
     out = self.linear(h)
     # Get projection of final featureset onto class vectors and add to evidence
-    out = out + torch.sum(self.embed(y) * h, 1, keepdim=True)
+    # out = out + torch.sum(self.embed(y) * h, 1, keepdim=True)
     return out
 
 # Parallelized G_D to minimize cross-gpu communication
@@ -448,3 +450,8 @@ class G_D(nn.Module):
           return D_out, G_z
         else:
           return D_out
+
+
+
+def BigGANDiscriminatorCh64Res128():
+    return Discriminator(D_ch=64, resolution=128, output_dim=1000)
